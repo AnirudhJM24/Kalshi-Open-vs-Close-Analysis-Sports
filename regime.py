@@ -1,25 +1,20 @@
 """
-Kalshi Sports — Open vs Close Regime Analysis (v3)
+Kalshi Sports — Open vs Close Regime Analysis (v4)
 ====================================================
 Single-sport analysis over the last N days of settled markets.
 
-Improvements over v2:
-  1. Filters out live-settled contracts (p_close ≤ 0.03 or ≥ 0.97) where
-     the outcome was already known — these inflate Brier close scores.
-  2. Deduplicates paired contracts (Team A / Team B mirrors) so each game
-     is counted once, not twice.
-  3. Bootstrap confidence intervals on Brier improvement between regimes
-     so you know if findings are real or noise.
-  4. Closing Line Value (CLV) analysis — converts academic accuracy metrics
-     into actionable trading signals.
-  5. argparse CLI: run non-interactively with --sport nba --days 30, or
-     interactively with no args.
+Changes from v3:
+  - Removed upset regime (broken after dedup, uses retroactive labels)
+  - Added day-of-week regime (observable before games start)
+  - Added per-contract volume from candlestick data
+  - Volume-weighted Brier scores
+  - Volume in calibration, CLV, and sanity outputs
 
 Usage:
-  python kalshi_regimes_v3.py                     # interactive sport picker
-  python kalshi_regimes_v3.py --sport nba          # NBA, last 30 days
-  python kalshi_regimes_v3.py --sport nhl --days 14 --no-cache
-  python kalshi_regimes_v3.py --list               # show available sports
+  python kalshi_regimes_v4.py                     # interactive sport picker
+  python kalshi_regimes_v4.py --sport nba          # NBA, last 30 days
+  python kalshi_regimes_v4.py --sport nhl --days 14 --no-cache
+  python kalshi_regimes_v4.py --list               # show available sports
 """
 
 # ── Imports ──────────────────────────────────────────────────────────────────
@@ -381,8 +376,26 @@ def _daily_window(close_dt_utc: pd.Timestamp) -> tuple[int, int]:
     return start_ts, end_ts
 
 
+def _extract_candle_volume(candles: list[dict]) -> int:
+    """Sum volume across all candles. Tries volume_fp (string) then volume (int)."""
+    total = 0
+    for c in candles:
+        # Prefer volume_fp (fixed-point string), fall back to volume (int)
+        vfp = c.get("volume_fp")
+        if vfp is not None:
+            try:
+                total += int(float(vfp))
+                continue
+            except (TypeError, ValueError):
+                pass
+        v = c.get("volume")
+        if isinstance(v, (int, float)):
+            total += int(v)
+    return total
+
+
 def _process_market(series_ticker: str, m: dict) -> Optional[dict]:
-    """Process a single market: fetch candles, extract open/close, return row dict."""
+    """Process a single market: fetch candles, extract open/close + volume, return row dict."""
     ticker = m.get("ticker") or m.get("market_ticker") or m.get("id")
     if not ticker:
         return None
@@ -397,14 +410,26 @@ def _process_market(series_ticker: str, m: dict) -> Optional[dict]:
     p_open, p_close = open_close_from_candles(candles)
     if p_open is None or p_close is None:
         return None
+
+    # Volume: sum across hourly candles for this market's trading window
+    volume = _extract_candle_volume(candles)
+
+    # Day of week from close time in ET (0=Mon, 6=Sun)
+    close_et = close_dt.tz_convert(CFG.day_tz)
+    dow = close_et.dayofweek  # 0=Mon ... 6=Sun
+    dow_name = close_et.strftime("%A")  # "Monday", "Tuesday", etc.
+
     return {
         "series": series_ticker,
         "market": ticker,
         "close_dt_utc": close_dt,
-        "day": close_dt.tz_convert(CFG.day_tz).floor("D").tz_convert("UTC"),
+        "day": close_et.floor("D").tz_convert("UTC"),
         "y": int(y),
         "p_open": float(p_open),
         "p_close": float(p_close),
+        "volume": volume,
+        "dow": dow,
+        "dow_name": dow_name,
     }
 
 
@@ -445,7 +470,7 @@ def build_contract_df(markets_by_series: dict[str, list[dict]]) -> pd.DataFrame:
 
 # ── Step 3: Feature Engineering ──────────────────────────────────────────────
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add drift, edge, favorite, underdog_win columns (vectorized)."""
+    """Add drift, edge, favorite, underdog_win, and CLV columns (vectorized)."""
     df = df.copy()
     df["drift"] = df["p_close"] - df["p_open"]
     df["abs_drift"] = df["drift"].abs()
@@ -453,6 +478,12 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df["edge_close"] = df["y"] - df["p_close"]
     df["favorite"] = (df["p_open"] > 0.5).astype(int)
     df["underdog_win"] = ((df["p_open"] < 0.5) & (df["y"] == 1)).astype(int)
+    # CLV features (also used by DOW regime)
+    df["clv_raw"] = df["p_close"] - df["p_open"]
+    df["clv_correct"] = (((df["y"] == 1) & (df["clv_raw"] > 0)) |
+                         ((df["y"] == 0) & (df["clv_raw"] < 0))).astype(int)
+    df["pnl_buy_open"] = df["y"] - df["p_open"]
+    df["clv_edge"] = df["p_close"] - df["p_open"]
     return df
 
 
@@ -534,6 +565,8 @@ def _aggregate_daily(df_series: pd.DataFrame) -> pd.DataFrame:
         df_series.groupby("day")
         .agg(
             n=("market", "size"),
+            total_volume=("volume", "sum"),
+            mean_volume=("volume", "mean"),
             mean_abs_drift=("abs_drift", "mean"),
             mean_drift=("drift", "mean"),
             brier_open=("edge_open", _brier),
@@ -651,40 +684,44 @@ def drift_regime_analysis(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     return summary_df, boot_results
 
 
-def upset_regime_analysis(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Regime 2: Upset-heavy vs Favorite-dominant days."""
-    results = []
-    boot_results = {}
+def dow_regime_analysis(df: pd.DataFrame) -> pd.DataFrame:
+    """Regime 2: Day-of-week — observable before games start.
 
+    Groups contracts by the day of week they closed (ET), then compares
+    Brier scores, drift, volume, and CLV across weekdays.
+    """
+    results = []
     for series, df_s in df.groupby("series"):
-        daily = _aggregate_daily(df_s)
-        if daily["underdog_win_rate"].nunique() < 3:
+        if len(df_s) < 10:
             continue
-        daily["upset_regime"] = _classify_regime(
-            daily["underdog_win_rate"], "Favorite-dominant", "Upset-heavy"
-        )
-        summary = (
-            daily.groupby("upset_regime")
+
+        agg = (
+            df_s.groupby("dow_name")
             .agg(
-                days=("day", "size"),
-                avg_n=("n", "mean"),
-                underdog_win_rate=("underdog_win_rate", "mean"),
-                mean_abs_drift=("mean_abs_drift", "mean"),
-                brier_open=("brier_open", "mean"),
-                brier_close=("brier_close", "mean"),
-                favorite_rate=("favorite_rate", "mean"),
+                games=("market", "size"),
+                total_volume=("volume", "sum"),
+                mean_volume=("volume", "mean"),
+                mean_abs_drift=("abs_drift", "mean"),
+                mean_drift=("drift", "mean"),
+                brier_open=("edge_open", _brier),
+                brier_close=("edge_close", _brier),
+                clv_correct_rate=("clv_correct", "mean"),
+                favorite_rate=("favorite", "mean"),
             )
             .reset_index()
         )
-        summary["brier_improvement"] = summary["brier_open"] - summary["brier_close"]
-        summary["series"] = series
-        results.append(summary)
+        agg["brier_improvement"] = agg["brier_open"] - agg["brier_close"]
+        agg["series"] = series
 
-        boot = _bootstrap_brier_improvement(daily, "upset_regime", "Upset-heavy", "Favorite-dominant")
-        boot_results[series] = boot
+        # Sort by day of week order
+        dow_order = {"Monday": 0, "Tuesday": 1, "Wednesday": 2, "Thursday": 3,
+                     "Friday": 4, "Saturday": 5, "Sunday": 6}
+        agg["_sort"] = agg["dow_name"].map(dow_order)
+        agg = agg.sort_values("_sort").drop(columns="_sort")
 
-    summary_df = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
-    return summary_df, boot_results
+        results.append(agg)
+
+    return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
 
 
 def _print_bootstrap_results(boot_results: dict, regime_name: str):
@@ -702,37 +739,13 @@ def _print_bootstrap_results(boot_results: dict, regime_name: str):
 def clv_analysis(df: pd.DataFrame) -> pd.DataFrame:
     """Closing Line Value analysis — did the open price have exploitable edge?
 
-    For each contract:
-      clv = p_close - p_open  (if y=1, positive CLV = open was underpriced)
-      clv = p_open - p_close  (if y=0, positive CLV = open was overpriced correctly)
-
-    Simplified: CLV = (y - p_open) * sign(p_close - p_open)
-    But more intuitively: if you bought YES at open and the close moved toward
-    the outcome, you captured positive CLV.
-
-    We compute:
-      - buy_at_open: hypothetical PnL of buying YES at p_open
-      - clv_raw: p_close - p_open (positive = line moved up)
-      - clv_correct: 1 if the close moved toward the actual outcome
+    CLV features are pre-computed in add_features():
+      - clv_raw: p_close - p_open
+      - clv_correct: 1 if the line moved toward the actual outcome
+      - pnl_buy_open: y - p_open
+      - clv_edge: p_close - p_open (for YES buyers)
     """
     df = df.copy()
-
-    # Raw CLV: how much did the line move?
-    df["clv_raw"] = df["p_close"] - df["p_open"]
-
-    # Did the line move in the "correct" direction?
-    # If y=1, correct = price went up. If y=0, correct = price went down.
-    df["clv_correct"] = ((df["y"] == 1) & (df["clv_raw"] > 0)) | \
-                        ((df["y"] == 0) & (df["clv_raw"] < 0))
-    df["clv_correct"] = df["clv_correct"].astype(int)
-
-    # Expected value of buying YES at open, settling at outcome
-    # PnL = y - p_open  (you pay p_open, receive 1 if yes, 0 if no)
-    df["pnl_buy_open"] = df["y"] - df["p_open"]
-
-    # CLV edge: how much better was your entry (open) vs the "efficient" close?
-    # If you buy at open and the close is higher, you got a bargain (positive CLV)
-    df["clv_edge"] = df["p_close"] - df["p_open"]  # for YES buyers
 
     # Aggregate by regime
     overall = {
@@ -752,6 +765,7 @@ def clv_analysis(df: pd.DataFrame) -> pd.DataFrame:
         df.groupby("pbin", observed=True)
         .agg(
             n=("market", "size"),
+            mean_volume=("volume", "mean"),
             mean_clv=("clv_raw", "mean"),
             clv_correct_rate=("clv_correct", "mean"),
             mean_pnl=("pnl_buy_open", "mean"),
@@ -810,6 +824,7 @@ def calibration_analysis(df: pd.DataFrame) -> pd.DataFrame:
         df.groupby("pbin", observed=True)
         .agg(
             n=("market", "size"),
+            mean_volume=("volume", "mean"),
             implied_open=("p_open", "mean"),
             implied_close=("p_close", "mean"),
             realized=("y", "mean"),
@@ -839,16 +854,20 @@ def sanity_plots(df: pd.DataFrame):
     """Quick distribution checks."""
     for series, grp in df.groupby("series"):
         print(f"\n  {series}: {len(grp)} contracts")
-        print(grp[["p_open", "p_close", "drift", "abs_drift"]].describe().round(4).to_string())
+        print(grp[["p_open", "p_close", "drift", "abs_drift", "volume"]].describe().round(4).to_string())
 
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        fig, axes = plt.subplots(1, 3, figsize=(16, 4))
         grp["p_open"].hist(bins=50, ax=axes[0], alpha=0.7)
-        axes[0].set_title(f"Opening Price Distribution — {CFG.target_name}")
+        axes[0].set_title(f"Opening Price — {CFG.target_name}")
         axes[0].set_xlabel("p_open")
 
         grp["drift"].hist(bins=60, ax=axes[1], alpha=0.7, color="orange")
         axes[1].set_title(f"Drift (close − open) — {CFG.target_name}")
         axes[1].set_xlabel("drift")
+
+        grp["volume"].hist(bins=40, ax=axes[2], alpha=0.7, color="green")
+        axes[2].set_title(f"Volume per Contract — {CFG.target_name}")
+        axes[2].set_xlabel("volume (contracts traded)")
 
         plt.tight_layout()
         plt.show()
@@ -975,17 +994,33 @@ def main():
         print("\n  Bootstrap significance (High drift improvement vs Low drift improvement):")
         _print_bootstrap_results(drift_boot, "drift")
 
-    # Upset regime
+    # Day-of-week regime
     print("\n" + "─" * 50)
-    print("  UPSET REGIME (Outcome)")
+    print("  DAY-OF-WEEK REGIME")
     print("─" * 50)
-    upset_df, upset_boot = upset_regime_analysis(df)
-    if upset_df.empty:
-        print("  Not enough data for upset regime analysis.")
+    dow_df = dow_regime_analysis(df)
+    if dow_df.empty:
+        print("  Not enough data for day-of-week analysis.")
     else:
-        print(upset_df.to_string(index=False))
-        print("\n  Bootstrap significance (Upset-heavy improvement vs Favorite-dominant):")
-        _print_bootstrap_results(upset_boot, "upset")
+        print(dow_df.to_string(index=False))
+
+    # Volume summary
+    print("\n" + "─" * 50)
+    print("  VOLUME SUMMARY")
+    print("─" * 50)
+    total_vol = df["volume"].sum()
+    mean_vol = df["volume"].mean()
+    median_vol = df["volume"].median()
+    print(f"  Total volume across all contracts: {total_vol:,}")
+    print(f"  Mean volume per contract: {mean_vol:,.0f}")
+    print(f"  Median volume per contract: {median_vol:,.0f}")
+    # Volume-weighted Brier
+    if total_vol > 0:
+        vw_brier_open = np.average(df["edge_open"] ** 2, weights=df["volume"]) if df["volume"].sum() > 0 else np.nan
+        vw_brier_close = np.average(df["edge_close"] ** 2, weights=df["volume"]) if df["volume"].sum() > 0 else np.nan
+        print(f"  Volume-weighted Brier (open):  {vw_brier_open:.4f}")
+        print(f"  Volume-weighted Brier (close): {vw_brier_close:.4f}")
+        print(f"  Volume-weighted improvement:   {vw_brier_open - vw_brier_close:.4f}")
 
     # CLV
     print("\n" + "─" * 50)
@@ -1014,8 +1049,7 @@ def main():
         "df_live_settled": df_live,
         "drift_summary": drift_df,
         "drift_bootstrap": drift_boot,
-        "upset_summary": upset_df,
-        "upset_bootstrap": upset_boot,
+        "dow_summary": dow_df,
         "clv": clv_df,
         "calibration": cal_df,
     }
