@@ -3,3 +3,4 @@ pandas
 matplotlib
 requests
 streamlit
+altair<5
