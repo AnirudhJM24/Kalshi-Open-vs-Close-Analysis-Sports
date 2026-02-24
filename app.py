@@ -1,22 +1,34 @@
+"""
+Kalshi Sports -- Open vs Close Regime Analysis (Streamlit Dashboard)
+
+Run with:  streamlit run app.py
+"""
+
+# Force non-interactive backend BEFORE any matplotlib import.
+# This is critical on headless Linux servers where no display is available.
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import streamlit as st
 
-import regime
-
+import kalshi_analysis as ka
 
 st.set_page_config(
-    page_title="Kalshi Sports — Open vs Close Regime (Streamlit)",
+    page_title="Kalshi Sports -- Open vs Close Regime Analysis",
     layout="wide",
 )
 
 
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
 def _get_sport_choices() -> list[tuple[str, str]]:
-    """Return list of (short, display_name) from regime.SPORT_MENU."""
+    """Return list of (short, display_name) from the sport registry."""
     return [
         (short, display)
-        for _, (_, short, display) in sorted(regime.SPORT_MENU.items())
+        for _, (_, short, display) in sorted(ka.SPORT_MENU.items())
     ]
 
 
@@ -30,60 +42,46 @@ def run_regime_pipeline(
     no_cache: bool,
 ):
     """Run the core regime pipeline for given settings and return dataframes."""
-    ticker, name = regime.resolve_sport(sport_short)
+    ticker, name = ka.resolve_sport(sport_short)
 
-    # Configure global CFG used by regime.py
-    regime.CFG.lookback_days = days
-    regime.CFG.max_workers = workers
-    regime.CFG.no_cache = no_cache
-    regime.CFG.set_sport(ticker, name)
+    ka.CFG.lookback_days = days
+    ka.CFG.max_workers = workers
+    ka.CFG.no_cache = no_cache
+    ka.CFG.set_sport(ticker, name)
 
-    markets_by_series = regime.fetch_settled_markets_single(ticker)
+    empty_result = {
+        "sport_ticker": ticker,
+        "sport_name": name,
+        "df": pd.DataFrame(),
+        "df_live": pd.DataFrame(),
+        "drift_df": pd.DataFrame(),
+        "drift_boot": {},
+        "dow_df": pd.DataFrame(),
+    }
+
+    markets_by_series = ka.fetch_settled_markets_single(ticker)
     markets = markets_by_series.get(ticker, [])
     if len(markets) == 0:
-        return {
-            "sport_ticker": ticker,
-            "sport_name": name,
-            "df": pd.DataFrame(),
-            "df_live": pd.DataFrame(),
-            "drift_df": pd.DataFrame(),
-            "drift_boot": {},
-            "dow_df": pd.DataFrame(),
-        }
+        return empty_result
 
-    df = regime.build_contract_df(markets_by_series)
+    df = ka.build_contract_df(markets_by_series)
     if df.empty:
-        return {
-            "sport_ticker": ticker,
-            "sport_name": name,
-            "df": df,
-            "df_live": pd.DataFrame(),
-            "drift_df": pd.DataFrame(),
-            "drift_boot": {},
-            "dow_df": pd.DataFrame(),
-        }
+        return empty_result
 
-    df = regime.add_features(df)
+    df = ka.add_features(df)
 
     if not keep_pairs:
-        df = regime.deduplicate_paired_contracts(df)
+        df = ka.deduplicate_paired_contracts(df)
 
     df_live = pd.DataFrame()
     if not keep_live_settled:
-        df, df_live = regime.filter_live_settled(df)
+        df, df_live = ka.filter_live_settled(df)
         if df.empty:
-            return {
-                "sport_ticker": ticker,
-                "sport_name": name,
-                "df": df,
-                "df_live": df_live,
-                "drift_df": pd.DataFrame(),
-                "drift_boot": {},
-                "dow_df": pd.DataFrame(),
-            }
+            empty_result["df_live"] = df_live
+            return empty_result
 
-    drift_df, drift_boot = regime.drift_regime_analysis(df)
-    dow_df = regime.dow_regime_analysis(df)
+    drift_df, drift_boot = ka.drift_regime_analysis(df)
+    dow_df = ka.dow_regime_analysis(df)
 
     return {
         "sport_ticker": ticker,
@@ -96,27 +94,32 @@ def run_regime_pipeline(
     }
 
 
+# ── Plotting Functions ───────────────────────────────────────────────────────
+# Each function creates a figure, passes it to st.pyplot(), then closes it
+# to prevent memory leaks on long-running Streamlit sessions.
+
 def plot_sanity(df: pd.DataFrame, target_name: str):
     fig, axes = plt.subplots(1, 3, figsize=(16, 4))
 
     df["p_open"].hist(bins=50, ax=axes[0], alpha=0.7)
-    axes[0].set_title(f"Opening Price — {target_name}")
+    axes[0].set_title(f"Opening Price -- {target_name}")
     axes[0].set_xlabel("p_open")
 
     df["drift"].hist(bins=60, ax=axes[1], alpha=0.7, color="orange")
-    axes[1].set_title(f"Drift (close − open) — {target_name}")
+    axes[1].set_title(f"Drift (close - open) -- {target_name}")
     axes[1].set_xlabel("drift")
 
     df["volume"].hist(bins=40, ax=axes[2], alpha=0.7, color="green")
-    axes[2].set_title(f"Volume per Contract — {target_name}")
+    axes[2].set_title(f"Volume per Contract -- {target_name}")
     axes[2].set_xlabel("volume (contracts traded)")
 
     plt.tight_layout()
     st.pyplot(fig)
+    plt.close(fig)
 
 
 def compute_clv(df: pd.DataFrame):
-    """Compute CLV summary and bucketed stats (mirrors regime.clv_analysis logic)."""
+    """Compute CLV summary and bucketed stats."""
     df = df.copy()
 
     overall = {
@@ -161,7 +164,7 @@ def plot_clv(clv_df: pd.DataFrame, clv_by_bucket: pd.DataFrame):
     axes[0].axvline(0, color="red", linestyle="--", alpha=0.7)
     mean_clv = clv_df["clv_raw"].mean()
     axes[0].axvline(mean_clv, color="orange", linestyle="-", linewidth=2, label=f"Mean CLV: {mean_clv:+.3f}")
-    axes[0].set_xlabel("CLV (close − open)")
+    axes[0].set_xlabel("CLV (close - open)")
     axes[0].set_ylabel("Count")
     axes[0].set_title("Closing Line Value Distribution")
     axes[0].legend()
@@ -185,6 +188,7 @@ def plot_clv(clv_df: pd.DataFrame, clv_by_bucket: pd.DataFrame):
 
     plt.tight_layout()
     st.pyplot(fig)
+    plt.close(fig)
 
 
 def compute_calibration(df: pd.DataFrame, target_name: str):
@@ -212,7 +216,7 @@ def compute_calibration(df: pd.DataFrame, target_name: str):
     ax.plot([0, 1], [0, 1], "--", color="gray", alpha=0.6, label="Perfect calibration")
     ax.set_xlabel("Implied probability")
     ax.set_ylabel("Realized win rate")
-    ax.set_title(f"Calibration: Open vs Close — {target_name}")
+    ax.set_title(f"Calibration: Open vs Close -- {target_name}")
     ax.legend()
     plt.tight_layout()
 
@@ -224,7 +228,6 @@ def plot_drift_regime(drift_df: pd.DataFrame):
         st.info("Not enough data for drift regime analysis.")
         return
 
-    # Aggregate across series (usually just one)
     agg = (
         drift_df.groupby("drift_regime")
         .agg(
@@ -245,10 +248,11 @@ def plot_drift_regime(drift_df: pd.DataFrame):
     ax.bar(x, agg["brier_improvement"], color="steelblue", alpha=0.8)
     ax.set_xticks(x)
     ax.set_xticklabels(agg["drift_regime"], rotation=0)
-    ax.set_ylabel("Brier improvement (open − close)")
+    ax.set_ylabel("Brier improvement (open - close)")
     ax.set_title("Brier Improvement by Drift Regime")
     plt.tight_layout()
     st.pyplot(fig)
+    plt.close(fig)
 
 
 def plot_dow_regime(dow_df: pd.DataFrame):
@@ -264,17 +268,20 @@ def plot_dow_regime(dow_df: pd.DataFrame):
     ax.bar(x, dow_df["brier_improvement"], color="purple", alpha=0.8)
     ax.set_xticks(x)
     ax.set_xticklabels(dow_df["dow_name"], rotation=15, ha="right")
-    ax.set_ylabel("Brier improvement (open − close)")
+    ax.set_ylabel("Brier improvement (open - close)")
     ax.set_title("Brier Improvement by Day of Week")
     plt.tight_layout()
     st.pyplot(fig)
+    plt.close(fig)
 
+
+# ── Main App ─────────────────────────────────────────────────────────────────
 
 def main():
-    st.title("Kalshi Sports — Open vs Close Regime (Streamlit)")
+    st.title("Kalshi Sports -- Open vs Close Regime Analysis")
     st.markdown(
-        "Single-sport analysis of Kalshi sports markets over the last N days, "
-        "visualized in Streamlit. This wraps the `regime.py` pipeline."
+        "Single-sport analysis of Kalshi sports markets over the last N days. "
+        "This wraps the `kalshi_analysis` pipeline."
     )
 
     # Sidebar controls
@@ -286,7 +293,7 @@ def main():
         "Sport",
         options=[s for s, _ in sport_choices],
         index=[s for s, _ in sport_choices].index(default_short),
-        format_func=lambda s: f"{s.upper()} — {short_to_name[s]}",
+        format_func=lambda s: f"{s.upper()} -- {short_to_name[s]}",
     )
 
     days = st.sidebar.slider("Lookback window (days)", min_value=7, max_value=90, value=30, step=1)
@@ -297,7 +304,7 @@ def main():
 
     st.sidebar.markdown("---")
     run_clicked = st.sidebar.button("Run analysis", type="primary")
-    st.sidebar.markdown("Run this app with:\n\n`streamlit run regime_streamlit_app.py`")
+    st.sidebar.markdown("Run this app with:\n\n`streamlit run app.py`")
 
     if not run_clicked:
         st.info("Choose a sport and options in the sidebar, then click **Run analysis** to fetch data and run the regime analysis.")
@@ -360,16 +367,14 @@ def main():
     brier_cols[1].metric("VW Brier (close)", f"{vw_brier_close:.4f}")
     brier_cols[2].metric("VW improvement", f"{vw_improvement:+.4f}")
 
-    tabs = st.tabs(
-        [
-            "Sanity",
-            "Drift Regime",
-            "Day-of-Week Regime",
-            "CLV",
-            "Calibration",
-            "Raw Contracts",
-        ]
-    )
+    tabs = st.tabs([
+        "Sanity",
+        "Drift Regime",
+        "Day-of-Week Regime",
+        "CLV",
+        "Calibration",
+        "Raw Contracts",
+    ])
 
     with tabs[0]:
         st.header("Sanity Checks")
@@ -390,7 +395,7 @@ def main():
 
         clv_metrics = st.columns(4)
         clv_metrics[0].metric("Contracts analyzed", f"{overall_clv['total_contracts']:,}")
-        clv_metrics[1].metric("Mean CLV (close − open)", f"{overall_clv['mean_clv_raw']:+.4f}")
+        clv_metrics[1].metric("Mean CLV (close - open)", f"{overall_clv['mean_clv_raw']:+.4f}")
         clv_metrics[2].metric("Line moved correctly", f"{overall_clv['clv_correct_rate']:.1%}")
         clv_metrics[3].metric("Mean PnL (buy YES at open)", f"{overall_clv['mean_pnl_buy_open']:+.4f}")
 
@@ -405,6 +410,7 @@ def main():
         st.dataframe(cal_bucket)
         st.subheader("Calibration Plot")
         st.pyplot(cal_fig)
+        plt.close(cal_fig)
 
     with tabs[5]:
         st.header("Raw Contract-Level Data")
@@ -413,4 +419,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

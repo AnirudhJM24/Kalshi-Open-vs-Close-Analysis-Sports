@@ -1,7 +1,18 @@
 [project]
-name = "kalshi-pca"
-version = "0.1.0"
-description = "Add your description here"
+name = "kalshi-open-close-analysis"
+version = "0.2.0"
+description = "Kalshi sports market open vs close regime analysis"
 readme = "README.md"
-requires-python = ">=3.13"
-dependencies = []
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "requests",
+    "streamlit",
+    "altair<5",
+    "standard-imghdr",
+]
+
+[project.scripts]
+kalshi-regime = "cli:main"
