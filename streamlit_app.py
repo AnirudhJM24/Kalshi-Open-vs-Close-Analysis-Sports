@@ -1,7 +1,7 @@
 """
 Kalshi Sports -- Open vs Close Regime Analysis (Streamlit Dashboard)
 
-Run with:  streamlit run app.py
+Run with:  streamlit run streamlit_app.py
 """
 
 # Force non-interactive backend BEFORE any matplotlib import.
